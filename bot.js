@@ -6,14 +6,37 @@ const path = require('path');
 const { ADMIN_NUMBER, PAYMENT_DETAILS, GROUP_CLASSES, PERSONAL_CLASSES, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } = require('./config');
 const ai = require('./ai');
 
-// --- Telegram Bot (for QR delivery) ---
+// --- Telegram Bot (for QR delivery + remote commands) ---
 let tgBot = null;
 if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
   const TelegramBot = require('node-telegram-bot-api');
-  tgBot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
-  console.log('📱 Telegram QR delivery enabled.');
+  tgBot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+  console.log('📱 Telegram bot enabled (QR + commands).');
+
+  // Only respond to the admin's Telegram chat
+  tgBot.onText(/\/resetqr/, async (msg) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    try {
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID, '🔄 Disconnecting WhatsApp... A new QR code will be sent shortly.');
+      qrSentToTelegram = false;
+      try { await client.logout(); } catch (e) { await client.destroy(); }
+      setTimeout(() => client.initialize(), 3000);
+    } catch (e) {
+      tgBot.sendMessage(TELEGRAM_CHAT_ID, `❌ Error: ${e.message}`).catch(() => {});
+    }
+  });
+
+  tgBot.onText(/\/status/, async (msg) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    const state = await client.getState().catch(() => 'UNKNOWN');
+    tgBot.sendMessage(TELEGRAM_CHAT_ID,
+      `📊 *Bot Status*\n\nWhatsApp: *${state}*\nBot: *${botActive ? 'ON' : 'OFF'}*\nAI Mode: *${aiModeActive ? 'ON' : 'OFF'}*\nContact Filter: *${contactFilterActive ? 'ON' : 'OFF'}*`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+  });
+
 } else {
-  console.log('⚠️  Telegram QR delivery disabled. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in config.js to enable.');
+  console.log('⚠️  Telegram disabled. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env to enable.');
 }
 
 // --- Group links (persisted to file) ---
@@ -174,7 +197,7 @@ client.on('qr', async (qr) => {
 });
 
 client.on('ready', () => {
-  qrSentToTelegram = false; // reset so a new QR is sent on next disconnect
+  qrSentToTelegram = false;
   console.log('✅ DUKEH Bot is ready!');
 });
 client.on('auth_failure', (msg) => console.error('❌ Auth failed:', msg));
@@ -187,11 +210,14 @@ client.on('disconnected', (reason) => {
 });
 
 // --- Main Message Handler ---
-client.on('message', async (msg) => {
+client.on('message_create', async (msg) => {
   if (msg.from.includes('@g.us') || msg.from === 'status@broadcast') return;
 
   const chatId = msg.from;
   const body = msg.body.trim();
+
+  // Self-messages: only process ! commands, skip bot flow
+  if (msg.fromMe && !body.startsWith('!')) return;
 
   // Admin commands — anyone who knows them can use them
   if (body.startsWith('!')) {
@@ -417,6 +443,19 @@ client.on('message', async (msg) => {
   if (contactFilterActive) {
     const contact = await msg.getContact();
     if (contact.isMyContact) return;
+  }
+
+  // --- Enquiry filter: only respond to new conversations that look like enquiries ---
+  const existingSession = sessions.get(chatId);
+  const hasActiveSession = existingSession && Date.now() - existingSession.lastActive < SESSION_TIMEOUT;
+
+  if (!hasActiveSession) {
+    const lower = body.toLowerCase();
+    const isEnquiry = /^(hi|hey|hello|helo|good\s*(morning|afternoon|evening|day)|how|what|please|pls|i\s*(want|need|am|like)|interested|import|class|register|sign\s*up|learn|price|cost|how\s*much|procurement|buy|sell|product|menu|start|info|help)/i.test(lower)
+      || msg.hasMedia  // photos (likely receipts)
+      || lower.length > 15;  // longer messages are usually genuine enquiries
+
+    if (!isEnquiry) return; // Ignore short random messages like "ok", "👍", "k"
   }
 
   // --- AI Mode: route all customer messages through Claude ---
@@ -981,6 +1020,36 @@ async function executeAIAction(action, msg, chatId) {
   }
 }
 
+// --- Clean up stale Chromium lock files (prevents Docker restart errors) ---
+function cleanChromiumLocks() {
+  const authDir = path.join(__dirname, '.wwebjs_auth');
+  if (!fs.existsSync(authDir)) return;
+  const walk = (dir) => {
+    try {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name === 'SingletonLock' || entry.name === 'SingletonCookie' || entry.name === 'SingletonSocket') {
+          fs.unlinkSync(full);
+          console.log(`🧹 Removed stale lock: ${entry.name}`);
+        }
+      }
+    } catch (e) {}
+  };
+  walk(authDir);
+}
+
+// --- Graceful shutdown ---
+async function shutdown(signal) {
+  console.log(`\n🛑 ${signal} received. Shutting down gracefully...`);
+  try { await client.destroy(); } catch (e) {}
+  if (tgBot) { try { tgBot.stopPolling(); } catch (e) {} }
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
 // --- Start ---
 console.log('🚀 Starting DUKEH Importation Bot...');
+cleanChromiumLocks();
 client.initialize();
