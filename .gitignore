@@ -1,0 +1,9 @@
+node_modules/
+.env
+.wwebjs_auth/
+.wwebjs_cache/
+pending-registrations.json
+group-links.json
+bot-settings.json
+authenticated-admins.json
+.agent/

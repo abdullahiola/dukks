@@ -1,0 +1,122 @@
+============================================
+   DUKEH IMPORTATION BOT — ADMIN COMMANDS
+============================================
+
+Send these commands from your admin WhatsApp number (07087466855) to control the bot.
+
+
+── BOT CONTROL ──────────────────────────
+
+!bot on          → Turns the bot ON (customers receive replies)
+!bot off         → Turns the bot OFF (customers are ignored)
+!bot status      → Shows if the bot is currently ON or OFF
+
+Default: Bot starts ON when launched.
+
+
+── CONTACT FILTER ───────────────────────
+
+!contact on      → Bot only replies to UNSAVED contacts (people not in your phone)
+!contact off     → Bot replies to EVERYONE
+!contact status  → Shows if the contact filter is ON or OFF
+
+Default: Contact filter starts OFF (everyone gets replies).
+
+
+── GROUP LINKS ──────────────────────────
+
+!links           → Shows all classes and their current group links
+
+!link 1 <url>    → Sets the group link for class #1
+!link 2 <url>    → Sets the group link for class #2
+  ...and so on
+
+!link remove 1   → Removes the group link for class #1
+!link remove 2   → Removes the group link for class #2
+  ...and so on
+
+Class Numbers:
+  1 = China Importation Masterclass
+  2 = Luxury Hair Importation Class
+  3 = Gadget Importation Class
+  4 = SHEIN Bale Importation Class
+  5 = T-Shirt Importation Class
+  6 = Blend Importation Class
+
+Example:
+  !link 1 https://chat.whatsapp.com/abc123def456
+  → Sets the China Masterclass group link
+
+Links are saved to a file (group-links.json) so they survive bot restarts.
+
+
+── REGISTRATION MANAGEMENT ─────────────
+
+!pending         → Shows all pending (unverified) registrations
+
+!verify <ID>     → Verifies a registration and sends the group link to the customer
+                    If a group link is stored for that class, it's sent automatically.
+                    If not, the bot asks you to paste the link.
+
+Example:
+  !verify 482910
+  → Confirms registration #482910 and sends the customer their group link
+
+
+── HOW THE FULL FLOW WORKS ─────────────
+
+1. Customer messages your WhatsApp → Bot shows the menu
+2. Customer picks a class → Bot asks for name and WhatsApp number
+3. Customer confirms → Bot sends you a notification:
+
+     🆕 New Registration #482910
+     Class: China Importation Masterclass
+     Name: John Doe
+     WhatsApp: 07012345678
+     Use !verify 482910 to confirm this registration.
+
+4. Customer sends payment receipt → Bot forwards it to you with details
+5. You check the receipt → Type: !verify 482910
+6. Bot sends the customer their confirmation + group link
+7. Done! ✅
+
+
+── DISCONNECT / RESCAN QR ──────────────
+
+!disconnect      → Disconnects WhatsApp and generates a new QR code
+                    Use this to switch WhatsApp accounts or re-link the bot.
+                    A new QR code will appear in the terminal and on Telegram
+                    (if configured).
+
+
+── TELEGRAM QR DELIVERY ────────────────
+
+If you host the bot on a VPS and can't see the terminal, the bot can
+send QR codes to your Telegram.
+
+Setup:
+  1. Open Telegram and search for @BotFather
+  2. Send /newbot and follow the prompts to create a bot
+  3. Copy the bot token (looks like 1234567890:ABCdef...)
+  4. Paste it in config.js → TELEGRAM_BOT_TOKEN
+  5. Send /start to your new bot
+  6. Search for @userinfobot on Telegram and send /start
+  7. Copy your Chat ID number
+  8. Paste it in config.js → TELEGRAM_CHAT_ID
+  9. Restart the bot — QR codes will now be sent to Telegram automatically
+
+
+── QUICK REFERENCE ─────────────────────
+
+!bot on / off / status
+!contact on / off / status
+!links
+!link <number> <url>
+!link remove <number>
+!verify <ID>
+!pending
+!disconnect              → Disconnect & rescan QR
+!commands                → Shows command list inside WhatsApp
+
+
+============================================
