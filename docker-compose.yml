@@ -1,0 +1,14 @@
+services:
+  dukeh-bot:
+    build: .
+    container_name: dukeh-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - dukeh-auth:/app/.wwebjs_auth
+      - dukeh-data:/app/data
+
+volumes:
+  dukeh-auth:
+  dukeh-data:

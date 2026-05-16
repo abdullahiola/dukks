@@ -38,6 +38,7 @@ RUN npm ci --production
 COPY . .
 
 # Persist WhatsApp session data so you don't have to re-scan QR after restart
-VOLUME ["/app/.wwebjs_auth"]
+# Persist bot data (settings, registrations, group links, admin auth)
+VOLUME ["/app/.wwebjs_auth", "/app/data"]
 
 CMD ["node", "bot.js"]

@@ -7,3 +7,4 @@ group-links.json
 bot-settings.json
 authenticated-admins.json
 .agent/
+*.docx
