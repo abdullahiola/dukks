@@ -4,7 +4,6 @@ const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 const { ADMIN_NUMBER, PAYMENT_DETAILS, GROUP_CLASSES, PERSONAL_CLASSES, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } = require('./config');
-const ai = require('./ai');
 
 // --- Telegram Bot (for QR delivery + remote commands) ---
 let tgBot = null;
@@ -13,26 +12,239 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
   tgBot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
   console.log('📱 Telegram bot enabled (QR + commands).');
 
-  // Only respond to the admin's Telegram chat
-  tgBot.onText(/\/resetqr/, async (msg) => {
-    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
-    try {
-      await tgBot.sendMessage(TELEGRAM_CHAT_ID, '🔄 Disconnecting WhatsApp... A new QR code will be sent shortly.');
-      qrSentToTelegram = false;
-      try { await client.logout(); } catch (e) { await client.destroy(); }
-      setTimeout(() => client.initialize(), 3000);
-    } catch (e) {
-      tgBot.sendMessage(TELEGRAM_CHAT_ID, `❌ Error: ${e.message}`).catch(() => {});
+  // Register command list so Telegram shows autocomplete preview when typing /
+  tgBot.setMyCommands([
+    { command: 'bot',        description: 'Toggle bot — on | off | status' },
+    { command: 'contact',    description: 'Toggle contact filter — on | off | status' },
+    { command: 'verify',     description: 'Verify a registration — /verify <ID>' },
+    { command: 'pending',    description: 'View all pending registrations' },
+    { command: 'links',      description: 'View all group links' },
+    { command: 'link',       description: 'Set a group link — /link <#> <url>' },
+    { command: 'disconnect', description: 'Disconnect WhatsApp & rescan QR' },
+    { command: 'status',     description: 'Show current bot status' },
+    { command: 'commands',   description: 'Show all available commands' },
+  ]).catch(e => console.error('Failed to register Telegram commands:', e.message));
+
+  // Global admin-only guard — silently ignore everyone else
+  tgBot.on('message', (msg) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) {
+      tgBot.sendMessage(msg.chat.id, '⛔ Unauthorized.').catch(() => {});
+    }
+  });
+  tgBot.on('callback_query', (query) => {
+    if (String(query.message.chat.id) !== TELEGRAM_CHAT_ID) {
+      tgBot.answerCallbackQuery(query.id, { text: '⛔ Unauthorized.' }).catch(() => {});
     }
   });
 
+  // All commands mirror WhatsApp (/ instead of !)
+
+  // /bot on | /bot off | /bot status
+  tgBot.onText(/\/bot\s+(on|off|status)/, async (msg, match) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    const sub = match[1].toLowerCase();
+    if (sub === 'on') {
+      botActive = true; saveSettings();
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID, '🟢 Bot is now *ON*. Customers will receive replies.', { parse_mode: 'Markdown' });
+    } else if (sub === 'off') {
+      botActive = false; saveSettings();
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID, '🔴 Bot is now *OFF*. Customers will not receive replies.', { parse_mode: 'Markdown' });
+    } else {
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID, botActive ? '🟢 Bot is currently *ON*.' : '🔴 Bot is currently *OFF*.', { parse_mode: 'Markdown' });
+    }
+  });
+
+  // /contact on | /contact off | /contact status
+  tgBot.onText(/\/contact\s+(on|off|status)/, async (msg, match) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    const sub = match[1].toLowerCase();
+    if (sub === 'on') {
+      contactFilterActive = true; saveSettings();
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID, '🟢 Contact filter *ON*. Bot will only reply to *unsaved* contacts.', { parse_mode: 'Markdown' });
+    } else if (sub === 'off') {
+      contactFilterActive = false; saveSettings();
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID, '🔴 Contact filter *OFF*. Bot will reply to *everyone*.', { parse_mode: 'Markdown' });
+    } else {
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID,
+        contactFilterActive ? '🟢 Contact filter is *ON* (unsaved only).' : '🔴 Contact filter is *OFF* (everyone).',
+        { parse_mode: 'Markdown' }
+      );
+    }
+  });
+
+  // /pending — view pending registrations
+  tgBot.onText(/\/pending/, async (msg) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    if (pendingRegistrations.size === 0) {
+      return tgBot.sendMessage(TELEGRAM_CHAT_ID, '📋 No pending registrations.');
+    }
+    let text = `📋 *Pending Registrations (${pendingRegistrations.size})*\n\n`;
+    for (const [id, reg] of pendingRegistrations) {
+      text += `*#${id}* — ${reg.name} | ${reg.className} | ${reg.phone}\n`;
+    }
+    text += `\n_Use /verify <ID> to confirm a registration._`;
+    await tgBot.sendMessage(TELEGRAM_CHAT_ID, text, { parse_mode: 'Markdown' });
+  });
+
+  // /links — list all group links
+  tgBot.onText(/\/links/, async (msg) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    let text = `🔗 <b>Group Links</b>\n\n`;
+    ALL_CLASSES.forEach((name, i) => {
+      const link = groupLinks[name];
+      text += `<b>${i + 1}.</b> ${name}\n${link ? `   ✅ ${link}` : '   ❌ No link set'}\n\n`;
+    });
+    text += `<i>Use /link &lt;number&gt; &lt;url&gt; to set a link.</i>\n`;
+    text += `<i>Use /link remove &lt;number&gt; to remove a link.</i>`;
+    await tgBot.sendMessage(TELEGRAM_CHAT_ID, text, { parse_mode: 'HTML' })
+      .catch(e => console.error('Failed to send /links:', e.message));
+  });
+
+  // /link remove <number>
+  tgBot.onText(/\/link\s+remove\s+(\d+)/, async (msg, match) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    const num = parseInt(match[1]);
+    if (!num || num < 1 || num > ALL_CLASSES.length) {
+      return tgBot.sendMessage(TELEGRAM_CHAT_ID, `❌ Invalid number. Use /links to see the list.`);
+    }
+    const className = ALL_CLASSES[num - 1];
+    delete groupLinks[className];
+    saveGroupLinks();
+    await tgBot.sendMessage(TELEGRAM_CHAT_ID, `✅ Group link removed for *${className}*.`, { parse_mode: 'Markdown' });
+  });
+
+  // /link <number> <url>
+  tgBot.onText(/\/link\s+(\d+)\s+(.+)/, async (msg, match) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    const num = parseInt(match[1]);
+    const url = match[2].trim();
+    if (!num || num < 1 || num > ALL_CLASSES.length) {
+      return tgBot.sendMessage(TELEGRAM_CHAT_ID, `❌ Invalid number. Use /links to see the list.`);
+    }
+    const className = ALL_CLASSES[num - 1];
+    groupLinks[className] = url;
+    saveGroupLinks();
+    await tgBot.sendMessage(TELEGRAM_CHAT_ID, `✅ Group link updated for *${className}*:\n${url}`, { parse_mode: 'Markdown' });
+  });
+
+  // /verify <ID>
+  tgBot.onText(/\/verify\s+(\d{6})/, async (msg, match) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    const regId = match[1];
+    const res = await verifyRegistration(regId);
+    if (res.success) {
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID, `✅ Confirmation sent to *${res.name}* (${res.phone}) for *${res.className}*.`, { parse_mode: 'Markdown' });
+    } else if (res.reason === 'not_found') {
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID, `❌ Registration *#${regId}* not found.`, { parse_mode: 'Markdown' });
+    } else if (res.reason === 'send_failed') {
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID, `❌ Failed to send WhatsApp confirmation: ${res.error}`);
+    } else if (res.reason === 'no_link') {
+      tgAdminState = { action: 'awaitGroupLink', regId };
+      await tgBot.sendMessage(TELEGRAM_CHAT_ID,
+        `📋 *Verifying Registration #${regId}*\n\n` +
+        `Name: *${res.name}*\nClass: *${res.className}*\nWhatsApp: *${res.phone}*\n\n` +
+        `⚠️ No group link stored for *${res.className}*.\nPlease send the *group link* for this customer.\n_Type *cancel* to cancel._`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  });
+
+  // /disconnect — logout WhatsApp and re-scan QR
+  tgBot.onText(/\/disconnect/, async (msg) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    await tgBot.sendMessage(TELEGRAM_CHAT_ID, '⚠️ *Disconnecting WhatsApp...*\nA new QR code will be sent shortly.', { parse_mode: 'Markdown' });
+    qrSentToTelegram = false;
+    try { await client.logout(); } catch (e) { await client.destroy(); }
+    setTimeout(() => client.initialize(), 3000);
+  });
+
+  // /status — show bot status
   tgBot.onText(/\/status/, async (msg) => {
     if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
     const state = await client.getState().catch(() => 'UNKNOWN');
     tgBot.sendMessage(TELEGRAM_CHAT_ID,
-      `📊 *Bot Status*\n\nWhatsApp: *${state}*\nBot: *${botActive ? 'ON' : 'OFF'}*\nAI Mode: *${aiModeActive ? 'ON' : 'OFF'}*\nContact Filter: *${contactFilterActive ? 'ON' : 'OFF'}*`,
+      `📊 *Bot Status*\n\nWhatsApp: *${state}*\nBot: *${botActive ? 'ON' : 'OFF'}*\nContact Filter: *${contactFilterActive ? 'ON' : 'OFF'}*`,
       { parse_mode: 'Markdown' }
     ).catch(() => {});
+  });
+
+  // /commands — show all available commands
+  tgBot.onText(/\/commands/, async (msg) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    await tgBot.sendMessage(TELEGRAM_CHAT_ID,
+      `🛠️ *Admin Commands*\n\n` +
+      `_Same as WhatsApp — just use / instead of !_\n\n` +
+      `/bot on\\/off\\/status — Toggle bot\n` +
+      `/contact on\\/off\\/status — Toggle contact filter\n` +
+      `/verify <ID> — Verify a registration\n` +
+      `/pending — View pending registrations\n` +
+      `/links — View all group links\n` +
+      `/link <#> <url> — Set\\/update a group link\n` +
+      `/link remove <#> — Remove a group link\n` +
+      `/disconnect — Disconnect WhatsApp & rescan QR\n` +
+      `/status — Show bot status\n` +
+      `/commands — Show this list`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  // Inline button callback query handler
+  tgBot.on('callback_query', async (query) => {
+    if (String(query.message.chat.id) !== TELEGRAM_CHAT_ID) return;
+    const data = query.data;
+    if (data.startsWith('verify_')) {
+      const regId = data.split('_')[1];
+      const res = await verifyRegistration(regId);
+      if (res.success) {
+        await tgBot.answerCallbackQuery(query.id, { text: `Approved #${regId}` });
+        let caption = query.message.caption || query.message.text || '';
+        caption = caption.replace(/_Click the button below or reply with.*confirm\._/, '');
+        const newText = `${caption}\n\n🟢 *Verified via Telegram*`;
+        if (query.message.photo) {
+          await tgBot.editMessageCaption(newText, { chat_id: TELEGRAM_CHAT_ID, message_id: query.message.message_id, parse_mode: 'Markdown' }).catch(() => {});
+        } else {
+          await tgBot.editMessageText(newText, { chat_id: TELEGRAM_CHAT_ID, message_id: query.message.message_id, parse_mode: 'Markdown' }).catch(() => {});
+        }
+      } else if (res.reason === 'no_link') {
+        await tgBot.answerCallbackQuery(query.id, { text: `No stored link for class!` });
+        tgAdminState = { action: 'awaitGroupLink', regId };
+        await tgBot.sendMessage(TELEGRAM_CHAT_ID,
+          `📋 *Verifying Registration #${regId}*\n\nName: *${res.name}*\nClass: *${res.className}*\nWhatsApp: *${res.phone}*\n\n` +
+          `⚠️ No group link stored for *${res.className}*.\nPlease send the *group link* for this customer.\n_Type *cancel* to cancel._`,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        await tgBot.answerCallbackQuery(query.id, { text: `Failed: ${res.reason}` });
+        await tgBot.sendMessage(TELEGRAM_CHAT_ID, `❌ Failed to verify #${regId}: ${res.reason || 'unknown'}`);
+      }
+    }
+  });
+
+  // Listen for plain text (e.g. group link submission when awaiting one)
+  tgBot.on('message', async (msg) => {
+    if (String(msg.chat.id) !== TELEGRAM_CHAT_ID) return;
+    const text = (msg.text || '').trim();
+    if (!text || text.startsWith('/')) return;
+
+    if (tgAdminState && tgAdminState.action === 'awaitGroupLink') {
+      const regId = tgAdminState.regId;
+      if (text.toLowerCase() === 'cancel') {
+        tgAdminState = null;
+        return tgBot.sendMessage(TELEGRAM_CHAT_ID, '❌ Verification cancelled.');
+      }
+      const reg = pendingRegistrations.get(regId);
+      if (reg) {
+        const res = await verifyRegistration(regId, text);
+        if (res.success) {
+          await tgBot.sendMessage(TELEGRAM_CHAT_ID, `✅ Confirmation sent to *${res.name}* (${res.phone}) with the group link.`, { parse_mode: 'Markdown' });
+        } else {
+          await tgBot.sendMessage(TELEGRAM_CHAT_ID, `❌ Failed: ${res.reason}`);
+        }
+      } else {
+        await tgBot.sendMessage(TELEGRAM_CHAT_ID, `❌ Registration *#${regId}* not found.`, { parse_mode: 'Markdown' });
+      }
+      tgAdminState = null;
+    }
   });
 
 } else {
@@ -70,6 +282,9 @@ const ALL_CLASSES = GROUP_CLASSES.map(c => c.name);
 const sessions = new Map();
 const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 min
 
+// Per-user processing lock — prevents duplicate replies from rapid messages
+const processingUsers = new Set();
+
 // --- Bot settings (persisted to file) ---
 const SETTINGS_FILE = path.join(__dirname, 'bot-settings.json');
 
@@ -81,12 +296,12 @@ function loadSettings() {
   } catch (e) {
     console.error('Failed to load settings:', e.message);
   }
-  return { botActive: true, contactFilterActive: false, aiModeActive: false };
+  return { botActive: true, contactFilterActive: false };
 }
 
 function saveSettings() {
   try {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ botActive, contactFilterActive, aiModeActive }, null, 2));
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ botActive, contactFilterActive }, null, 2));
   } catch (e) {
     console.error('Failed to save settings:', e.message);
   }
@@ -95,7 +310,6 @@ function saveSettings() {
 const loadedSettings = loadSettings();
 let botActive = loadedSettings.botActive;
 let contactFilterActive = loadedSettings.contactFilterActive;
-let aiModeActive = loadedSettings.aiModeActive;
 
 // --- Authenticated admins (persisted to file) ---
 const ADMINS_FILE = path.join(__dirname, 'authenticated-admins.json');
@@ -147,9 +361,38 @@ function saveRegistrations() {
 
 const pendingRegistrations = loadRegistrations();
 let adminState = null; // null or { action: 'awaitGroupLink', regId: '...' }
+let tgAdminState = null; // null or { action: 'awaitGroupLink', regId: '...' }
 
 function generateRegId() {
   return String(Math.floor(100000 + Math.random() * 900000)); // 6-digit random ID
+}
+
+async function verifyRegistration(regId, customLink = null) {
+  const reg = pendingRegistrations.get(regId);
+  if (!reg) {
+    return { success: false, reason: 'not_found' };
+  }
+  
+  const storedLink = customLink || groupLinks[reg.className];
+  if (storedLink) {
+    try {
+      await client.sendMessage(reg.chatId,
+        `🎉 *Your registration has been confirmed!*\n\n` +
+        `Class: *${reg.className}*\n` +
+        `Name: *${reg.name}*\n\n` +
+        `Here is your group link:\n${storedLink}\n\n` +
+        `Welcome to *DUKEH Importation*! 🙏`
+      );
+      pendingRegistrations.delete(regId);
+      saveRegistrations();
+      return { success: true, name: reg.name, phone: reg.phone, className: reg.className };
+    } catch (e) {
+      console.error('Failed to send confirmation:', e.message);
+      return { success: false, reason: 'send_failed', error: e.message };
+    }
+  } else {
+    return { success: false, reason: 'no_link', name: reg.name, phone: reg.phone, className: reg.className };
+  }
 }
 
 function getSession(chatId) {
@@ -169,7 +412,11 @@ function resetSession(chatId) {
 // --- WhatsApp Client ---
 const client = new Client({
   authStrategy: new LocalAuth(),
-  puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+  puppeteer: {
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    protocolTimeout: 120000, // 120s — prevents timeout on slow/busy machines
+  },
 });
 
 let qrSentToTelegram = false;
@@ -183,7 +430,7 @@ client.on('qr', async (qr) => {
     qrSentToTelegram = true;
     try {
       const qrBuffer = await QRCode.toBuffer(qr, { width: 512, margin: 2 });
-      await tgBot.sendPhoto(TELEGRAM_CHAT_ID, qrBuffer, {
+      await tgBot.sendPhoto(TELEGRAM_CHAT_ID, { source: qrBuffer, filename: 'qrcode.png' }, {
         caption: '📱 *DUKEH Bot — Scan this QR code in WhatsApp*\n\nOpen WhatsApp → Settings → Linked Devices → Link a Device',
         parse_mode: 'Markdown'
       });
@@ -218,6 +465,12 @@ client.on('message_create', async (msg) => {
 
   // Self-messages: only process ! commands, skip bot flow
   if (msg.fromMe && !body.startsWith('!')) return;
+
+  // Drop message if we're already handling one from this user
+  if (!body.startsWith('!') && processingUsers.has(chatId)) return;
+  if (!body.startsWith('!')) processingUsers.add(chatId);
+
+  try {
 
   // Admin commands — anyone who knows them can use them
   if (body.startsWith('!')) {
@@ -304,42 +557,27 @@ client.on('message_create', async (msg) => {
       if (!regId) {
         return msg.reply('Usage: *!verify <registration ID>*\n\nYou can also *reply* to a registration/receipt message with *!verify*');
       }
-      const reg = pendingRegistrations.get(regId);
-      if (!reg) {
+      
+      const res = await verifyRegistration(regId);
+      if (res.success) {
+        return msg.reply(`✅ Confirmation sent to *${res.name}* (${res.phone}) with the stored group link.`);
+      } else if (res.reason === 'not_found') {
         return msg.reply(`❌ Registration *#${regId}* not found. It may have already been verified or expired.`);
+      } else if (res.reason === 'send_failed') {
+        return msg.reply(`❌ Failed to send message to customer. ${res.error || ''}`);
+      } else if (res.reason === 'no_link') {
+        // No stored link — ask admin to paste one
+        adminState = { action: 'awaitGroupLink', regId };
+        return msg.reply(
+          `📋 *Verifying Registration #${regId}*\n\n` +
+          `Name: ${res.name}\n` +
+          `Class: ${res.className}\n` +
+          `WhatsApp: ${res.phone}\n\n` +
+          `⚠️ No group link stored for *${res.className}*.\n` +
+          `Please send the *group link* for this customer.\n` +
+          `_Type *cancel* to cancel._`
+        );
       }
-      console.log(`[VERIFY] Reg #${regId} — chatId: ${reg.chatId}, class: ${reg.className}`);
-      // Auto-use stored group link if available
-      const storedLink = groupLinks[reg.className];
-      if (storedLink) {
-        try {
-          await client.sendMessage(reg.chatId,
-            `🎉 *Your registration has been confirmed!*\n\n` +
-            `Class: *${reg.className}*\n` +
-            `Name: *${reg.name}*\n\n` +
-            `Here is your group link:\n${storedLink}\n\n` +
-            `Welcome to *DUKEH Importation*! 🙏`
-          );
-          await msg.reply(`✅ Confirmation sent to *${reg.name}* (${reg.phone}) with the stored group link.`);
-        } catch (e) {
-          console.error('Failed to send confirmation:', e.message);
-          await msg.reply(`❌ Failed to send message to customer.`);
-        }
-        pendingRegistrations.delete(regId);
-        saveRegistrations();
-        return;
-      }
-      // No stored link — ask admin to paste one
-      adminState = { action: 'awaitGroupLink', regId };
-      return msg.reply(
-        `📋 *Verifying Registration #${regId}*\n\n` +
-        `Name: ${reg.name}\n` +
-        `Class: ${reg.className}\n` +
-        `WhatsApp: ${reg.phone}\n\n` +
-        `⚠️ No group link stored for *${reg.className}*.\n` +
-        `Please send the *group link* for this customer.\n` +
-        `_Type *cancel* to cancel._`
-      );
     }
     if (body.toLowerCase() === '!links') {
       let text = `🔗 *Group Links*\n\n`;
@@ -384,28 +622,11 @@ client.on('message_create', async (msg) => {
       text += `\n_Use *!verify <ID>* to confirm a registration._`;
       return msg.reply(text);
     }
-    if (body.toLowerCase() === '!ai on') {
-      if (!process.env.ANTHROPIC_API_KEY) {
-        return msg.reply('❌ Cannot enable AI mode. Set *ANTHROPIC_API_KEY* in your .env file first.');
-      }
-      aiModeActive = true;
-      saveSettings();
-      return msg.reply('🧠 AI mode is now *ON*. Claude will handle all customer messages.');
-    }
-    if (body.toLowerCase() === '!ai off') {
-      aiModeActive = false;
-      saveSettings();
-      return msg.reply('🔴 AI mode is now *OFF*. Template flow restored.');
-    }
-    if (body.toLowerCase() === '!ai status') {
-      return msg.reply(aiModeActive ? '🧠 AI mode is *ON*.' : '🔴 AI mode is *OFF*.');
-    }
     if (body.toLowerCase() === '!commands') {
       return msg.reply(
         `🛠️ *Admin Commands*\n\n` +
         `*!bot on/off/status* — Toggle bot\n` +
         `*!contact on/off/status* — Toggle contact filter\n` +
-        `*!ai on/off/status* — Toggle AI mode (Claude)\n` +
         `*!verify <ID>* — Verify a registration\n` +
         `*!pending* — View pending registrations\n` +
         `*!links* — View all group links\n` +
@@ -458,15 +679,19 @@ client.on('message_create', async (msg) => {
     if (!isEnquiry) return; // Ignore short random messages like "ok", "👍", "k"
   }
 
-  // --- AI Mode: route all customer messages through Claude ---
-  if (aiModeActive) {
-    return handleAIMessage(msg, chatId, body);
-  }
-
-  // Global reset commands
-  if (['hi', 'hello', 'hey', 'menu', 'start', '0'].includes(body.toLowerCase())) {
+  // Explicit restart — always resets the conversation
+  if (['menu', 'start', '0'].includes(body.toLowerCase())) {
     resetSession(chatId);
     return sendWelcome(msg);
+  }
+
+  // Greeting — only start fresh if the user has no active session
+  if (['hi', 'hello', 'hey', 'helo'].includes(body.toLowerCase())) {
+    if (!hasActiveSession) {
+      resetSession(chatId);
+      return sendWelcome(msg);
+    }
+    // Has active session — let the current flow handle it
   }
 
   const session = getSession(chatId);
@@ -486,6 +711,9 @@ client.on('message_create', async (msg) => {
     default:
       resetSession(chatId);
       return sendWelcome(msg);
+  }
+  } finally {
+    processingUsers.delete(chatId);
   }
 });
 
@@ -527,7 +755,15 @@ async function handleWelcome(msg, session, body) {
       session.data.answers = [];
       return sendSmartQ1(msg);
     default:
-      return sendWelcome(msg);
+      return msg.reply(
+        `Please reply with a number to continue:\n\n` +
+        `1️⃣ Personal Importation Class (1-on-1 Training)\n` +
+        `2️⃣ Group Importation Classes\n` +
+        `3️⃣ Procurement & Personal Shopping\n` +
+        `4️⃣ Speak with Support\n` +
+        `5️⃣ Help me choose the right class\n\n` +
+        `_Type *menu* to see the full intro again._`
+      );
   }
 }
 
@@ -885,18 +1121,44 @@ async function handleRegistration(msg, session, body) {
       });
       saveRegistrations();
 
-      try {
-        await client.sendMessage(ADMIN_NUMBER,
-          `🆕 *New Registration #${regId}*\n\n` +
-          `Class: ${session.data.regClass}\n` +
-          `Type: ${session.data.regType}\n` +
-          `Price: ${session.data.regPrice}\n` +
-          `Name: ${session.data.regName}\n` +
-          `WhatsApp: ${session.data.regPhone}\n\n` +
-          `_Use *!verify ${regId}* to confirm this registration._`
-        );
-      } catch (e) {
-        console.error('Failed to notify admin:', e.message);
+      if (tgBot) {
+        try {
+          await tgBot.sendMessage(TELEGRAM_CHAT_ID,
+            `🆕 *New Registration #${regId}*\n\n` +
+            `Class: *${session.data.regClass}*\n` +
+            `Type: *${session.data.regType === 'personal' ? 'Personal (1-on-1)' : 'Group'}*\n` +
+            `Price: *${session.data.regPrice}*\n` +
+            `Name: *${session.data.regName}*\n` +
+            `WhatsApp: *${session.data.regPhone}*\n\n` +
+            `_Click the button below or reply with /verify ${regId} to confirm._`,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: '✅ Approve & Send Link', callback_data: `verify_${regId}` }
+                  ]
+                ]
+              }
+            }
+          );
+        } catch (e) {
+          console.error('Failed to notify admin on Telegram:', e.message);
+        }
+      } else {
+        try {
+          await client.sendMessage(ADMIN_NUMBER,
+            `🆕 *New Registration #${regId}*\n\n` +
+            `Class: ${session.data.regClass}\n` +
+            `Type: ${session.data.regType}\n` +
+            `Price: ${session.data.regPrice}\n` +
+            `Name: ${session.data.regName}\n` +
+            `WhatsApp: ${session.data.regPhone}\n\n` +
+            `_Use *!verify ${regId}* to confirm this registration._`
+          );
+        } catch (e) {
+          console.error('Failed to notify admin on WhatsApp:', e.message);
+        }
       }
       await msg.reply(
         `✅ *Registration Successful!*\n\n` +
@@ -924,9 +1186,31 @@ async function handleAwaitReceipt(msg, session, body) {
   if (msg.hasMedia) {
     try {
       const media = await msg.downloadMedia();
-      await client.sendMessage(ADMIN_NUMBER, media, {
-        caption: `🧾 *Receipt of Payment — Registration #${session.data.regId}*\n\nName: ${session.data.regName}\nClass: ${session.data.regClass}\nType: ${session.data.regType}\nPrice: ${session.data.regPrice}\nWhatsApp: ${session.data.regPhone}\n\n_Reply to this message with *!verify* to confirm._`
-      });
+      if (tgBot) {
+        const ext = media.mimetype?.includes('png') ? 'png' : 'jpg';
+        const buffer = Buffer.from(media.data, 'base64');
+        await tgBot.sendPhoto(TELEGRAM_CHAT_ID, { source: buffer, filename: `receipt.${ext}` }, {
+          caption: `🧾 *Receipt of Payment — Registration #${session.data.regId}*\n\n` +
+            `Name: *${session.data.regName}*\n` +
+            `Class: *${session.data.regClass}*\n` +
+            `Type: *${session.data.regType === 'personal' ? 'Personal (1-on-1)' : 'Group'}*\n` +
+            `Price: *${session.data.regPrice}*\n` +
+            `WhatsApp: *${session.data.regPhone}*\n\n` +
+            `_Click the button below or reply with /verify ${session.data.regId} to confirm._`,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '✅ Approve & Send Link', callback_data: `verify_${session.data.regId}` }
+              ]
+            ]
+          }
+        });
+      } else {
+        await client.sendMessage(ADMIN_NUMBER, media, {
+          caption: `🧾 *Receipt of Payment — Registration #${session.data.regId}*\n\nName: ${session.data.regName}\nClass: ${session.data.regClass}\nType: ${session.data.regType}\nPrice: ${session.data.regPrice}\nWhatsApp: ${session.data.regPhone}\n\n_Reply to this message with *!verify* to confirm._`
+        });
+      }
     } catch (e) {
       console.error('Failed to forward receipt:', e.message);
     }
@@ -942,82 +1226,6 @@ async function handleAwaitReceipt(msg, session, body) {
 
   // They sent text instead of an image
   await msg.reply(`📸 Please send a *photo or screenshot* of your receipt.\n\n_Type *menu* to skip and return to the main menu._`);
-}
-
-// --- AI Message Handler ---
-async function handleAIMessage(msg, chatId, body) {
-  try {
-    // Forward media to admin immediately
-    if (msg.hasMedia) {
-      try {
-        const media = await msg.downloadMedia();
-        await client.sendMessage(ADMIN_NUMBER, media, {
-          caption: `📨 *Media from customer* (AI Mode)\n\nFrom: ${chatId}${body ? '\nCaption: ' + body : ''}`,
-        });
-      } catch (e) {
-        console.error('Failed to forward media:', e.message);
-      }
-    }
-
-    let response = await ai.generateResponse(chatId, body, msg.hasMedia);
-
-    // Tool-use loop: execute actions and get final response
-    let loops = 0;
-    while (response.stopReason === 'tool_use' && response.actions.length > 0 && loops < 5) {
-      const toolResults = [];
-      for (const action of response.actions) {
-        const result = await executeAIAction(action, msg, chatId);
-        toolResults.push({ type: 'tool_result', tool_use_id: action.id, content: result });
-      }
-      response = await ai.continueAfterActions(chatId, toolResults);
-      loops++;
-    }
-
-    if (response.text) {
-      await msg.reply(response.text);
-    }
-  } catch (err) {
-    console.error('AI error:', err.message);
-    await msg.reply(
-      `I'm having trouble right now. Please try again in a moment.\n\n_If this persists, the admin has been notified._`
-    );
-  }
-}
-
-async function executeAIAction(action, msg, chatId) {
-  switch (action.tool) {
-    case 'create_registration': {
-      const { customer_name, phone_number, class_name, class_type, price } = action.input;
-      const regId = generateRegId();
-      pendingRegistrations.set(regId, {
-        chatId,
-        name: customer_name,
-        phone: phone_number,
-        className: class_name,
-        type: class_type,
-        price,
-      });
-      saveRegistrations();
-      await client.sendMessage(
-        ADMIN_NUMBER,
-        `🆕 *New Registration #${regId}* (AI Mode)\n\n` +
-          `Class: ${class_name}\nType: ${class_type}\nPrice: ${price}\n` +
-          `Name: ${customer_name}\nWhatsApp: ${phone_number}\n\n` +
-          `_Use *!verify ${regId}* to confirm._`
-      );
-      return `Registration created. ID: #${regId}. Admin has been notified. Now share the payment details with the customer.`;
-    }
-    case 'forward_to_admin': {
-      const { reason, details } = action.input;
-      await client.sendMessage(
-        ADMIN_NUMBER,
-        `📨 *${reason}* (AI Mode)\n\nFrom: ${chatId}\n\n${details}`
-      );
-      return 'Forwarded to admin successfully.';
-    }
-    default:
-      return 'Unknown action.';
-  }
 }
 
 // --- Clean up stale Chromium lock files (prevents Docker restart errors) ---
@@ -1048,6 +1256,19 @@ async function shutdown(signal) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// --- Crash recovery: auto-reinit on unhandled WhatsApp/Puppeteer errors ---
+process.on('unhandledRejection', (reason) => {
+  const msg = reason?.message || String(reason);
+  // Ignore non-critical Telegram polling errors
+  if (msg.includes('ETELEGRAM') || msg.includes('polling')) return;
+  console.error('⚠️  Unhandled rejection (auto-recovering):', msg);
+  setTimeout(() => {
+    console.log('🔄 Reinitializing WhatsApp client...');
+    cleanChromiumLocks();
+    client.initialize().catch(() => {});
+  }, 5000);
+});
 
 // --- Start ---
 console.log('🚀 Starting DUKEH Importation Bot...');
